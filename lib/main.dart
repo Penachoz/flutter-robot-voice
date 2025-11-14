@@ -1,33 +1,32 @@
+// lib/main.dart
 import 'dart:async';
-import 'dart:io';
 import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:speech_to_text/speech_to_text.dart' as stt;
-import 'package:flutter_vlc_player/flutter_vlc_player.dart';
 
-const String robotIp   = '192.168.4.1';     // <-- cámbialo si tu robot usa otra
-const int    robotPort = 5005;              // UDP puerto comandos
-const String rtspUrl   = 'rtsp://192.168.4.1:8554/stream'; // RTSP del robot
+// ====== AJUSTES POR DEFECTO ======
+const String kDefaultRobotIp = '192.168.4.1';
+const int    kSubPort        = 5007;  // suscripción de vídeo
+const int    kCmdPort        = 5005;  // comandos
+const int    kVideoPort      = 5600;  // puerto local UDP para recibir vídeo
 
-void main() {
-  WidgetsFlutterBinding.ensureInitialized();
-  runApp(const RobotDogApp());
-}
+void main() => runApp(const RobotDogApp());
 
 class RobotDogApp extends StatelessWidget {
   const RobotDogApp({super.key});
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Robot Dog Controller',
+      title: 'RobotDog (UDP ultra-low-latency)',
       theme: ThemeData(colorSchemeSeed: Colors.indigo, useMaterial3: true),
       home: const HomePage(),
     );
   }
 }
-
-enum ControlMode { voice, ps4 }
 
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
@@ -36,235 +35,404 @@ class HomePage extends StatefulWidget {
 }
 
 class _HomePageState extends State<HomePage> {
-  ControlMode _mode = ControlMode.voice;
-  late VlcPlayerController _vlc;
+  // ---- IP del robot (editable en UI) ----
+  final _ipCtrl = TextEditingController(text: kDefaultRobotIp);
+  String get _robotIp => _ipCtrl.text.trim();
+  InternetAddress? _parseIp(String s) => InternetAddress.tryParse(s.trim());
+
+  // ---- Sockets UDP ----
+  RawDatagramSocket? _txSock;   // para enviar (cmd + subscribe)
+  RawDatagramSocket? _vidSock;  // bind local para vídeo
+  Timer? _subTimer;
+
+  // ---- Reensamblador de frames ----
+  final _assembler = FrameAssembler();
+  Uint8List? _lastJpeg;
+  int _fpsCount = 0;
+  DateTime _fpsT0 = DateTime.now();
+  double _fps = 0;
+
+  // ---- Voz (push-to-talk) ----
   final stt.SpeechToText _stt = stt.SpeechToText();
-  bool _sttAvailable = false;
-  bool _listening = false;
+  bool _sttReady = false;
+  bool _holding = false;
   String _partial = '';
-  RawDatagramSocket? _udp;
-  Timer? _sttKeepAlive;
 
   @override
   void initState() {
     super.initState();
-    _vlc = VlcPlayerController.network(
-      rtspUrl,
-      hwAcc: HwAcc.full,
-      options: VlcPlayerOptions(),
-    );
     _initAll();
   }
 
   Future<void> _initAll() async {
-    await _ensurePermissions();
-    await _openUdp();
-    await _initSTT();
-    if (mounted) setState(() {});
-    // arranca en modo VOZ por defecto
-    _sendMode(ControlMode.voice);
-    _startVoiceLoopIfNeeded();
-  }
+    // Permisos
+    await Permission.microphone.request();
 
-  Future<void> _ensurePermissions() async {
-    await [Permission.microphone].request();
-  }
-
-  Future<void> _openUdp() async {
-    _udp?.close();
-    _udp = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
-    _udp!.readEventsEnabled = true;
-  }
-
-  Future<void> _initSTT() async {
-    _sttAvailable = await _stt.initialize(
+    // Inicializa STT (suelta PTT si el motor se detiene o hay error)
+    _sttReady = await _stt.initialize(
+      onError: (e) {
+        debugPrint('STT error: $e');
+        _unholdAndStop();
+      },
       onStatus: (s) {
+        debugPrint('STT status: $s');
         if (s == 'done' || s == 'notListening') {
-          _listening = false;
-          _restartSTTIfVoiceMode();
+          _unholdAndStop();
         }
       },
-      onError: (e) {
-        _listening = false;
-        _restartSTTIfVoiceMode(delayMs: 500);
-      },
-      debugLogging: false,
     );
+
+    // Sockets
+    _txSock  = await RawDatagramSocket.bind(InternetAddress.anyIPv4, 0);
+    _vidSock = await RawDatagramSocket.bind(InternetAddress.anyIPv4, kVideoPort);
+    _vidSock!.listen(_onVideoDatagram);
+
+    // Suscripción keepalive al vídeo
+    _sendSubscribe();
+    _subTimer?.cancel();
+    _subTimer = Timer.periodic(const Duration(seconds: 2), (_) => _sendSubscribe());
+
+    if (mounted) setState(() {});
   }
 
-  void _restartSTTIfVoiceMode({int delayMs = 100}) {
-    _sttKeepAlive?.cancel();
-    if (_mode == ControlMode.voice && _sttAvailable) {
-      _sttKeepAlive = Timer(Duration(milliseconds: delayMs), _startListening);
+  // Helper: suelta PTT y detiene STT seguro
+  Future<void> _unholdAndStop() async {
+    if (_holding) {
+      _holding = false;
+      if (mounted) setState(() {});
+    }
+    try {
+      await _stt.stop();
+    } catch (_) {}
+  }
+
+  void _sendSubscribe() {
+    final ip = _parseIp(_robotIp) ?? _parseIp(kDefaultRobotIp);
+    if (ip == null) return; // evita crash si el campo está vacío o mal
+    final payload = utf8.encode('{"type":"subscribe","video_port":$kVideoPort}');
+    _txSock?.send(payload, ip, kSubPort);
+  }
+
+  void _onVideoDatagram(RawSocketEvent e) {
+    if (e != RawSocketEvent.read) return;
+    final dg = _vidSock?.receive();
+    if (dg == null) return;
+
+    final data = dg.data;
+    if (data.lengthInBytes < UdpHdr.size) return;
+
+    final hdr = UdpHdr.tryParse(data);
+    if (hdr == null) return;
+
+    final payload = data.buffer.asUint8List(UdpHdr.size, data.lengthInBytes - UdpHdr.size);
+    final complete = _assembler.push(hdr, payload);
+    if (complete != null) {
+      _lastJpeg = complete;
+      _fpsCount++;
+      final now = DateTime.now();
+      final dt = now.difference(_fpsT0).inMilliseconds;
+      if (dt > 1000) {
+        _fps = (_fpsCount * 1000.0) / dt;
+        _fpsCount = 0;
+        _fpsT0 = now;
+      }
+      if (mounted) setState(() {});
     }
   }
 
-  void _startVoiceLoopIfNeeded() {
-    if (_mode == ControlMode.voice) _startListening();
-  }
-
-  void _startListening() async {
-    if (!_sttAvailable || _listening) return;
+  // ========= PUSH-TO-TALK =========
+  Future<void> _startPTT() async {
+    if (!_sttReady || _holding) return;
+    _holding = true;
     _partial = '';
-    _listening = await _stt.listen(
-      localeId: 'es_CO',              // ajusta a tu acento; ej: es_ES, es_MX
+    if (mounted) setState(() {});
+
+    await _stt.listen(
+      localeId: 'es_CO', // ajusta si prefieres es_ES / es_MX
       listenMode: stt.ListenMode.dictation,
       partialResults: true,
-      onResult: (res) {
-        final txt = (res.recognizedWords ?? '').toLowerCase().trim();
-        setState(() => _partial = txt);
-        if (txt.isNotEmpty) _maybeSendCommand(txt);
-        // speech_to_text suele cortar a los ~60s; onStatus gatilla reintento
+      onResult: (res) async {
+        final txt = (res.recognizedWords).toLowerCase().trim();
+        if (txt.isEmpty) return;
+        if (mounted) setState(() => _partial = txt);
+
+        final hit = _matchFirstKeyword(txt);
+        if (hit != null) {
+          final kw  = hit.key;
+          final cmd = hit.value;
+
+          // 1) soltar PTT y parar STT
+          await _unholdAndStop();
+
+          // 2) feedback + envío
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              SnackBar(content: Text('CMD: $cmd (via "$kw")')),
+            );
+          }
+          _sendCmd(cmd);
+        }
       },
     );
-    if (!_listening) _restartSTTIfVoiceMode(delayMs: 500);
   }
 
-  void _stopListening() {
-    _stt.stop();
-    _listening = false;
+  Future<void> _stopPTT() async {
+    await _unholdAndStop();
   }
 
-  // --- Mapeo de palabras -> comandos ---
-  static final List<String> _synFwd  = ['avanza','adelante','avance','vamos'];
-  static final List<String> _synStop = ['alto','para','detente','parate','frena','stop','quieto','basta','deten'];
-  static final List<String> _synL    = ['izquierda','izq'];
-  static final List<String> _synR    = ['derecha','der'];
-  static final List<String> _synSit  = ['sentado','siéntate','sientate'];
-  static final List<String> _synStnd = ['parado','de pie','levántate','levantate','arriba'];
+  // ---- Palabras clave -> comando (toma la PRIMERA que aparezca) ----
+  static final _synFwd  = ['avanza','adelante','avance','vamos'];
+  static final _synStop = ['alto','para','detente','parate','frena','stop','quieto','basta','deten'];
+  static final _synL    = ['izquierda','izq'];
+  static final _synR    = ['derecha','der'];
+  static final _synSit  = ['sentado','siéntate','sientate'];
+  static final _synStnd = ['parado','de pie','levántate','levantate','arriba'];
 
-  void _maybeSendCommand(String text) {
-    bool containsAny(List<String> keys) => keys.any((k) => text.contains(k));
-    String? cmd;
-    if      (containsAny(_synFwd))  cmd = 'FORWARD';
-    else if (containsAny(_synStop)) cmd = 'STOP';
-    else if (containsAny(_synL))    cmd = 'LEFT';
-    else if (containsAny(_synR))    cmd = 'RIGHT';
-    else if (containsAny(_synSit))  cmd = 'SIT';
-    else if (containsAny(_synStnd)) cmd = 'STAND';
-
-    if (cmd != null) {
-      _sendCmd(cmd);
-      // feedback visual rápido
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(content: Text('CMD: $cmd')),
-      );
+  MapEntry<String,String>? _matchFirstKeyword(String text) {
+    final candidates = <MapEntry<String,String>>[];
+    void add(List<String> keys, String cmd) {
+      for (final k in keys) {
+        final i = text.indexOf(k);
+        if (i >= 0) candidates.add(MapEntry('$i|$k', cmd));
+      }
     }
-  }
+    add(_synFwd,  'FORWARD');
+    add(_synStop, 'STOP');
+    add(_synL,    'LEFT');
+    add(_synR,    'RIGHT');
+    add(_synSit,  'SIT');
+    add(_synStnd, 'STAND');
 
-  void _sendMode(ControlMode m) {
-    _mode = m;
-    final payload = jsonEncode({
-      'type': 'mode',
-      'value': (m == ControlMode.voice) ? 'voice' : 'ps4',
+    if (candidates.isEmpty) return null;
+    candidates.sort((a,b){
+      final ia = int.parse(a.key.split('|').first);
+      final ib = int.parse(b.key.split('|').first);
+      return ia.compareTo(ib);
     });
-    _sendUdp(payload);
-    if (m == ControlMode.voice) {
-      _startListening();
-    } else {
-      _stopListening();
-    }
-    setState(() {});
+    final first = candidates.first;
+    final kw = first.key.split('|')[1];
+    return MapEntry(kw, first.value);
   }
 
-  void _sendCmd(String value) {
-    final payload = jsonEncode({'type': 'cmd', 'value': value});
-    _sendUdp(payload);
-  }
-
-  void _sendUdp(String payload) {
-    final data = utf8.encode(payload);
-    _udp?.send(data, InternetAddress(robotIp), robotPort);
+  void _sendCmd(String cmd) {
+    final ip = _parseIp(_robotIp) ?? _parseIp(kDefaultRobotIp);
+    if (ip == null) return;
+    final payload = utf8.encode(jsonEncode({"type":"cmd","value":cmd}));
+    _txSock?.send(payload, ip, kCmdPort);
   }
 
   @override
   void dispose() {
-    _sttKeepAlive?.cancel();
-    _stopListening();
-    _udp?.close();
-    _vlc.dispose();
+    _subTimer?.cancel();
+    _vidSock?.close();
+    _txSock?.close();
+    _stt.stop();
+    _ipCtrl.dispose();
     super.dispose();
-    }
+  }
 
   @override
   Widget build(BuildContext context) {
-    final isVoice = _mode == ControlMode.voice;
+    final img = _lastJpeg;
+
     return Scaffold(
-      appBar: AppBar(title: const Text('Robot Dog Controller')),
+      appBar: AppBar(title: const Text('RobotDog (UDP ultra-low-latency)')),
       body: Column(
         children: [
-          // STREAM DE CÁMARA
-          AspectRatio(
-            aspectRatio: 16 / 9,
-            child: VlcPlayer(
-              controller: _vlc,
-              aspectRatio: 16 / 9,
-              placeholder: const Center(child: CircularProgressIndicator()),
-            ),
-          ),
-          const SizedBox(height: 12),
-          // BOTONES DE MODO
-          Row(
-            mainAxisAlignment: MainAxisAlignment.center,
-            children: [
-              FilledButton(
-                onPressed: () => _sendMode(ControlMode.voice),
-                style: FilledButton.styleFrom(
-                  backgroundColor: isVoice ? Colors.indigo : null,
-                ),
-                child: const Text('Modo Voz'),
-              ),
-              const SizedBox(width: 12),
-              FilledButton.tonal(
-                onPressed: () => _sendMode(ControlMode.ps4),
-                style: FilledButton.styleFrom(
-                  backgroundColor: !isVoice ? Colors.indigo : null,
-                ),
-                child: const Text('Modo PS4'),
-              ),
-            ],
-          ),
-          const SizedBox(height: 12),
-          // ESTADO DE VOZ
-          if (isVoice) Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 16),
-            child: Column(
+          // ---- IP del robot + Conectar ----
+          Padding(
+            padding: const EdgeInsets.fromLTRB(12, 12, 12, 4),
+            child: Row(
               children: [
-                Row(
-                  mainAxisAlignment: MainAxisAlignment.center,
-                  children: [
-                    Icon(_listening ? Icons.mic : Icons.mic_off,
-                        color: _listening ? Colors.red : Colors.grey),
-                    const SizedBox(width: 8),
-                    Text(_listening ? 'Escuchando…' : 'No escuchando'),
-                  ],
-                ),
-                const SizedBox(height: 8),
-                Container(
-                  width: double.infinity,
-                  padding: const EdgeInsets.all(12),
-                  decoration: BoxDecoration(
-                    color: Colors.black12,
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    _partial.isEmpty ? 'Di: avanza, alto, izquierda, derecha, sentado, parado…' : _partial,
-                    style: const TextStyle(fontSize: 16),
+                Expanded(
+                  child: TextField(
+                    controller: _ipCtrl,
+                    decoration: const InputDecoration(
+                      labelText: 'IP del robot',
+                      border: OutlineInputBorder(),
+                      isDense: true,
+                    ),
+                    keyboardType: TextInputType.number,
                   ),
                 ),
-                const SizedBox(height: 8),
-                Wrap(
-                  spacing: 8,
-                  children: [
-                    OutlinedButton(onPressed: _startListening, child: const Text('Reintentar')),
-                    OutlinedButton(onPressed: _stopListening,   child: const Text('Pausar')),
-                  ],
+                const SizedBox(width: 8),
+                FilledButton(
+                  onPressed: () {
+                    _sendSubscribe(); // reenvía suscripción con nueva IP
+                    ScaffoldMessenger.of(context).showSnackBar(
+                      SnackBar(content: Text('Suscrito a ${_robotIp}:$kSubPort')),
+                    );
+                  },
+                  child: const Text('Conectar'),
                 ),
               ],
             ),
           ),
+
+          // ---- VIDEO ----
+          AspectRatio(
+            aspectRatio: 16/9,
+            child: Container(
+              color: Colors.black,
+              child: img == null
+                  ? const Center(
+                      child: Text('Esperando video…',
+                          style: TextStyle(color: Colors.white70)))
+                  : Image.memory(img, gaplessPlayback: true, fit: BoxFit.contain),
+            ),
+          ),
+
+          // ---- Estado / Texto reconocido ----
+          Padding(
+            padding: const EdgeInsets.all(8),
+            child: Row(
+              children: [
+                Text('FPS ~ ${_fps.toStringAsFixed(1)}'),
+                const SizedBox(width: 8),
+                Expanded(
+                  child: Text(
+                    _partial.isEmpty
+                      ? 'Mantén pulsado para hablar: avanza, alto, izquierda, derecha, sentado, parado…'
+                      : _partial,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    textAlign: TextAlign.center,
+                  ),
+                ),
+                const SizedBox(width: 8),
+                Icon(_holding ? Icons.mic : Icons.mic_none,
+                    color: _holding ? Colors.red : Colors.grey),
+              ],
+            ),
+          ),
+
+          const SizedBox(height: 8),
+
+          // ---- PUSH TO TALK ----
+          GestureDetector(
+            onTapDown: (_) => _startPTT(),
+            onTapUp:   (_) => _stopPTT(),
+            onTapCancel: () => _stopPTT(),
+            child: Container(
+              padding: const EdgeInsets.symmetric(vertical: 14, horizontal: 22),
+              decoration: BoxDecoration(
+                color: _holding ? Colors.red : Colors.indigo,
+                borderRadius: BorderRadius.circular(12),
+                boxShadow: const [BoxShadow(color: Colors.black26, blurRadius: 8)],
+              ),
+              child: Text(
+                _holding ? 'Escuchando… suelta para enviar' : 'Mantén pulsado para hablar',
+                style: const TextStyle(color: Colors.white, fontSize: 16),
+              ),
+            ),
+          ),
+
+          const SizedBox(height: 10),
+
+          // ---- Botones rápidos (debug) ----
+          Wrap(
+            spacing: 8, runSpacing: 8,
+            children: [
+              OutlinedButton(onPressed: ()=> _sendCmd('FORWARD'), child: const Text('FORWARD')),
+              OutlinedButton(onPressed: ()=> _sendCmd('STOP'),    child: const Text('STOP')),
+              OutlinedButton(onPressed: ()=> _sendCmd('LEFT'),    child: const Text('LEFT')),
+              OutlinedButton(onPressed: ()=> _sendCmd('RIGHT'),   child: const Text('RIGHT')),
+              OutlinedButton(onPressed: ()=> _sendCmd('SIT'),     child: const Text('SIT')),
+              OutlinedButton(onPressed: ()=> _sendCmd('STAND'),   child: const Text('STAND')),
+            ],
+          ),
+
+          const SizedBox(height: 10),
         ],
       ),
     );
+  }
+}
+
+// =================== Reensamblado UDP (MJPEG fragmentado) ===================
+
+class UdpHdr {
+  // "MJPG" (0x4D4A5047) | seq | ts(64) | frameLen | fragIdx | fragCnt
+  final int magic, seq;
+  final int tsMsHi, tsMsLo;
+  final int frameLen;
+  final int fragIdx, fragCnt;
+
+  static const size = 24; // 4 + 4 + 8 + 4 + 2 + 2
+
+  UdpHdr(this.magic, this.seq, this.tsMsHi, this.tsMsLo, this.frameLen, this.fragIdx, this.fragCnt);
+
+  static UdpHdr? tryParse(Uint8List d) {
+    if (d.lengthInBytes < size) return null;
+    final b = ByteData.sublistView(d);
+    final magic = b.getUint32(0, Endian.big);
+    if (magic != 0x4D4A5047) return null; // "MJPG"
+
+    final seq     = b.getUint32(4, Endian.big);
+    final tsHi    = b.getUint32(8, Endian.big);
+    final tsLo    = b.getUint32(12, Endian.big);
+    final flen    = b.getUint32(16, Endian.big);
+    final fragIdx = b.getUint16(20, Endian.big);
+    final fragCnt = b.getUint16(22, Endian.big);
+    return UdpHdr(magic, seq, tsHi, tsLo, flen, fragIdx, fragCnt);
+  }
+}
+
+class FrameAssembler {
+  final _map = <int, _Pending>{};
+  int _lastGoodSeq = -1;
+
+  Uint8List? push(UdpHdr h, Uint8List payload) {
+    // descarta frames demasiado viejos para evitar “goma”
+    if (_lastGoodSeq != -1 && h.seq + 32 < _lastGoodSeq) return null;
+
+    final p = _map.putIfAbsent(h.seq, () => _Pending(h.frameLen, h.fragCnt));
+    p.add(h.fragIdx, payload);
+
+    // limpieza para limitar memoria
+    if (_map.length > 48) {
+      final keys = _map.keys.toList()..sort();
+      for (int i = 0; i < keys.length - 24; ++i) {
+        _map.remove(keys[i]);
+      }
+    }
+
+    if (p.isComplete) {
+      _lastGoodSeq = h.seq;
+      _map.remove(h.seq);
+      return p.join();
+    }
+    return null;
+  }
+}
+
+class _Pending {
+  final int total;
+  final int fragCnt;
+  final List<Uint8List?> frags;
+  int arrived = 0;
+
+  _Pending(this.total, this.fragCnt)
+      : frags = List<Uint8List?>.filled(fragCnt, null, growable: false);
+
+  void add(int idx, Uint8List data) {
+    if (idx < 0 || idx >= fragCnt) return;
+    if (frags[idx] == null) {
+      frags[idx] = data;
+      arrived++;
+    }
+  }
+
+  bool get isComplete => arrived == fragCnt;
+
+  Uint8List join() {
+    final out = Uint8List(total);
+    int off = 0;
+    for (final f in frags) {
+      final d = f!;
+      out.setRange(off, off + d.length, d);
+      off += d.length;
+    }
+    return out;
   }
 }
