@@ -20,10 +20,16 @@ const List<String> synStop = [
 ];
 const List<String> synL    = ['izquierda', 'izq'];
 const List<String> synR    = ['derecha', 'der'];
+
+// Opcional: giros explícitos
+const List<String> synTurnL = ['gira a la izquierda', 'giro izquierda'];
+const List<String> synTurnR = ['gira a la derecha', 'giro derecha'];
+
+// Si luego quieres SIT/STAND, se pueden mapear a otros chars
+// por ahora los ignoro para no ensuciar el protocolo.
 const List<String> synSit  = ['sentado', 'siéntate', 'sientate'];
 const List<String> synStnd = ['parado', 'de pie', 'levántate', 'levantate', 'arriba'];
 
-// Toma la PRIMERA palabra que aparezca en el texto
 CommandMatch? matchFirstKeyword(String text) {
   final candidates = <MapEntry<String, String>>[];
 
@@ -36,12 +42,17 @@ CommandMatch? matchFirstKeyword(String text) {
     }
   }
 
-  add(synFwd,  'FORWARD');
-  add(synStop, 'STOP');
-  add(synL,    'LEFT');
-  add(synR,    'RIGHT');
-  add(synSit,  'SIT');
-  add(synStnd, 'STAND');
+  // ⚠️ Aquí mapeamos directamente al protocolo de la Pi:
+  add(synFwd,   'I'); // forward
+  add(synStop,  'K'); // stop
+  add(synL,     'J'); // left strafe
+  add(synR,     'L'); // right strafe
+  add(synTurnL, 'U'); // left turn
+  add(synTurnR, 'O'); // right turn
+
+  // (Opcional: por ahora SIT/STAND los podrías mapear a 'K' = stop)
+  // add(synSit,  'K');
+  // add(synStnd, 'K');
 
   if (candidates.isEmpty) return null;
 
