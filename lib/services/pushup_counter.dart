@@ -29,7 +29,7 @@ class PushupCounterService {
 
   int _count = 0;
   String _stage = 'up';
-  String _feedback = 'Preparing model...';
+  String _feedback = 'Loading model...';
 
   // Info del modelo
   late List<int> _inputShape;   // [1, H, W, 3]
@@ -45,14 +45,13 @@ class PushupCounterService {
       final options = InterpreterOptions()..threads = 2;
 
       _interpreter = await Interpreter.fromAsset(
-        // OJO: esta ruta debe coincidir EXACTO con pubspec.yaml
         'assets/models/lite-model_movenet_singlepose_lightning_tflite_float16_4.tflite',
         options: options,
       );
 
       final inputTensor = _interpreter!.getInputTensor(0);
-      _inputShape = inputTensor.shape;     // ej: [1,192,192,3]
-      _inputType  = inputTensor.type;
+      _inputShape  = inputTensor.shape;     // ej: [1,192,192,3]
+      _inputType   = inputTensor.type;
       _inputHeight = _inputShape[1];
       _inputWidth  = _inputShape[2];
 
@@ -76,7 +75,6 @@ class PushupCounterService {
     _interpreter?.close();
   }
 
-  // Calcula ángulo entre 3 puntos (como en tu JS)
   double _angle(Offset a, Offset b, Offset c) {
     final ab = math.atan2(a.dy - b.dy, a.dx - b.dx);
     final cb = math.atan2(c.dy - b.dy, c.dx - b.dx);
@@ -86,9 +84,7 @@ class PushupCounterService {
     return angle;
   }
 
-  /// Construye el input en el tipo correcto según _inputType.
   Object _buildInput(img.Image resized) {
-    // Modelos float → usamos double (0..1)
     if (_inputType == TensorType.float32 ||
         _inputType == TensorType.float16) {
       return [
@@ -108,7 +104,6 @@ class PushupCounterService {
       ];
     }
 
-    // Modelos cuantizados uint8 / int8 → usamos int 0..255
     if (_inputType == TensorType.uint8 || _inputType == TensorType.int8) {
       return [
         List.generate(
@@ -117,28 +112,26 @@ class PushupCounterService {
             _inputWidth,
             (x) {
               final img.Pixel p = resized.getPixel(x, y);
-              return [p.r, p.g, p.b]; // ints
+              return [p.r, p.g, p.b];
             },
           ),
         ),
       ];
     }
 
-    // Otros tipos no soportados
     throw Exception('Tipo de tensor no soportado: $_inputType');
   }
 
-  /// Procesa un frame. Devuelve nuevo estado o null si se salta el frame.
   Future<PushupState?> processFrame(Uint8List jpeg) async {
     if (_interpreter == null) {
-      // Modelo NO cargado aún → devuelvo estado con feedback actual
+      // Modelo no cargado aún
       return PushupState(
         count: _count,
         stage: _stage,
         feedback: _feedback,
         keypoints: const [],
-        imageWidth: 0,
-        imageHeight: 0,
+        imageWidth: 640,
+        imageHeight: 480,
       );
     }
 
@@ -146,35 +139,30 @@ class PushupCounterService {
     _busy = true;
 
     try {
-      // 1. Decode JPEG
       final img.Image? image = img.decodeJpg(jpeg);
       if (image == null) {
         print('[Pushup] decodeJpg devolvió null');
         return null;
       }
 
-      // 2. Resize a tamaño del modelo (H,W)
       final resized = img.copyResize(
         image,
         width: _inputWidth,
         height: _inputHeight,
       );
 
-      // 3. Armar input con el tipo correcto
       final Object input = _buildInput(resized);
 
-      // 4. Output [1,1,17,3]
       final output =
           List.filled(1 * 1 * 17 * 3, 0.0).reshape([1, 1, 17, 3]);
 
       _interpreter!.run(input, output);
 
-      // 5. Convertir a coords de la imagen original
       final keypoints = <Offset>[];
 
       for (int i = 0; i < 17; i++) {
-        final yNorm = output[0][0][i][0] as double; // y normalizada
-        final xNorm = output[0][0][i][1] as double; // x normalizada
+        final yNorm = output[0][0][i][0] as double;
+        final xNorm = output[0][0][i][1] as double;
         final score = output[0][0][i][2] as double;
 
         if (score > 0.5) {
@@ -186,10 +174,9 @@ class PushupCounterService {
         }
       }
 
-      // Índices MoveNet: 5=left_shoulder, 7=left_elbow, 9=left_wrist
       const leftShoulder = 5;
-      const leftElbow = 7;
-      const leftWrist = 9;
+      const leftElbow    = 7;
+      const leftWrist    = 9;
 
       final ls = keypoints[leftShoulder];
       final le = keypoints[leftElbow];
@@ -231,7 +218,6 @@ class PushupCounterService {
       print(st);
       _feedback = 'Error procesando frame: $e';
 
-      // Devuelvo estado para que al menos veas el error en pantalla
       return PushupState(
         count: _count,
         stage: _stage,

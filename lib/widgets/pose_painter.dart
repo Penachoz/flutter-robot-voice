@@ -11,7 +11,6 @@ class PosePainter extends CustomPainter {
     required this.imageHeight,
   });
 
-  // Pairs de keypoints según MoveNet
   static const List<List<int>> _edges = [
     [5, 7], [7, 9],      // left arm
     [6, 8], [8, 10],     // right arm
@@ -40,7 +39,6 @@ class PosePainter extends CustomPainter {
       ..strokeWidth = 2.0
       ..style = PaintingStyle.stroke;
 
-    // Dibujar skeleton
     for (final edge in _edges) {
       final p1 = keypoints[edge[0]];
       final p2 = keypoints[edge[1]];
@@ -51,7 +49,6 @@ class PosePainter extends CustomPainter {
       canvas.drawLine(a, b, linePaint);
     }
 
-    // Dibujar puntos
     for (final p in keypoints) {
       if (p == Offset.zero) continue;
       final pt = Offset(p.dx * scaleX, p.dy * scaleY);

@@ -27,14 +27,13 @@ class _WorkoutPageState extends State<WorkoutPage> {
 
   Future<void> _init() async {
     await _pushupService.init();
-    _loop(); // pequeño loop que procesa frames cada X ms
+    _loop();
   }
 
   void _loop() async {
     while (mounted) {
       final jpeg = widget.videoService.lastJpeg;
       if (jpeg != null) {
-        // throttle: procesa 1 de cada 3 frames aprox
         if (_frameSkip++ % 3 == 0) {
           final st = await _pushupService.processFrame(jpeg);
           if (st != null && mounted) {
@@ -55,13 +54,12 @@ class _WorkoutPageState extends State<WorkoutPage> {
   @override
   Widget build(BuildContext context) {
     final imgBytes = widget.videoService.lastJpeg;
-    final count = _state?.count ?? 0;
-    final stage = _state?.stage ?? '-';
+    final count    = _state?.count ?? 0;
+    final stage    = _state?.stage ?? '-';
     final feedback =
         _state?.feedback ?? _pushupService.debugFeedback;
 
-    // Si aún no tenemos tamaño real de la imagen, asumimos 640x480
-    final imageWidth = _state?.imageWidth ?? 640;
+    final imageWidth  = _state?.imageWidth  ?? 640;
     final imageHeight = _state?.imageHeight ?? 480;
 
     return Scaffold(
@@ -85,7 +83,7 @@ class _WorkoutPageState extends State<WorkoutPage> {
                           Image.memory(
                             imgBytes,
                             fit: BoxFit.cover,
-                            gaplessPlayback: true, // <- NO titila
+                            gaplessPlayback: true,
                           ),
                           if (_state != null)
                             CustomPaint(
